@@ -3,10 +3,12 @@
 import base64
 import time
 import requests
+import os
 
-CLIENT_ID = "bf02dee1b0154b99882b4bb4625514cb"
-CLIENT_SECRET = "YOUR_NEW_SECRET_HERE"
-REFRESH_TOKEN = "ZhL1qla0aU+nMSrVmqx2dA=="
+CLIENT_ID = os.getenv("CLIENT_ID")
+CLIENT_SECRET = os.getenv("CLIENT_SECRET")
+REFRESH_TOKEN = os.getenv("REFRESH_TOKEN")
+
 
 TOKEN_URL = "https://login.eveonline.com/v2/oauth/token"
 ESI_BASE = "https://esi.evetech.net/latest"

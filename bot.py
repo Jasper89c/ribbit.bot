@@ -6,7 +6,9 @@ from discord.ext import commands
 
 from contract_scanner import scan_contracts
 
-TOKEN = "YOUR_DISCORD_BOT_TOKEN_HERE"
+import os
+TOKEN = os.getenv("DISCORD_TOKEN")
+
 
 intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
