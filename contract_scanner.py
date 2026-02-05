@@ -1,23 +1,24 @@
 # contract_scanner.py
 
-import csv
+import asyncio
 from collections import Counter
-from esi_auth import esi_get, get_access_token, ESI_BASE
+from typing import Dict, Tuple
+
+from esi_auth import esi_get, ESI_BASE
 
 CORP_ID = 98820373
 
-type_cache = {}
-group_cache = {}
-category_cache = {}
-location_cache = {}
+type_cache: Dict[int, dict] = {}
+group_cache: Dict[int, str] = {}
+category_cache: Dict[int, str] = {}
+location_cache: Dict[int, str] = {}
 
 
-def get_type_info(type_id):
+async def get_type_info(type_id: int) -> dict:
     if type_id in type_cache:
         return type_cache[type_id]
 
-    url = f"{ESI_BASE}/universe/types/{type_id}/"
-    data = esi_get(url)
+    data = await esi_get(f"/universe/types/{type_id}/")
     if not data:
         info = {"name": f"Type {type_id}", "group_id": None, "category_id": None}
         type_cache[type_id] = info
@@ -27,11 +28,13 @@ def get_type_info(type_id):
     category_id = None
 
     if group_id:
-        g_url = f"{ESI_BASE}/universe/groups/{group_id}/"
-        g_data = esi_get(g_url)
+        if group_id in group_cache:
+            # category might already be cached via another type
+            pass
+        g_data = await esi_get(f"/universe/groups/{group_id}/")
         if g_data:
             category_id = g_data.get("category_id")
-            group_cache[group_id] = g_data.get("name")
+            group_cache[group_id] = g_data.get("name", f"Group {group_id}")
 
     info = {
         "name": data.get("name", f"Type {type_id}"),
@@ -42,8 +45,8 @@ def get_type_info(type_id):
     return info
 
 
-def is_ship(type_id):
-    info = get_type_info(type_id)
+async def is_ship(type_id: int) -> bool:
+    info = await get_type_info(type_id)
     cat_id = info["category_id"]
     if cat_id is None:
         return False
@@ -51,30 +54,29 @@ def is_ship(type_id):
     if cat_id in category_cache:
         return category_cache[cat_id] == "Ship"
 
-    url = f"{ESI_BASE}/universe/categories/{cat_id}/"
-    data = esi_get(url)
+    data = await esi_get(f"/universe/categories/{cat_id}/")
     name = data.get("name", "Unknown") if data else "Unknown"
     category_cache[cat_id] = name
     return name == "Ship"
 
 
-def get_location_name(location_id):
+async def get_location_name(location_id: int | None) -> str:
     if not location_id:
         return "Unknown"
 
     if location_id in location_cache:
         return location_cache[location_id]
 
+    # Stations
     if location_id < 1_000_000_000:
-        url = f"{ESI_BASE}/universe/stations/{location_id}/"
-        data = esi_get(url)
+        data = await esi_get(f"/universe/stations/{location_id}/")
         if data:
             name = data.get("name", f"Station {location_id}")
             location_cache[location_id] = name
             return name
 
-    url = f"{ESI_BASE}/universe/structures/{location_id}/"
-    data = esi_get(url)
+    # Structures
+    data = await esi_get(f"/universe/structures/{location_id}/")
     if data:
         name = data.get("name", f"Structure {location_id}")
         location_cache[location_id] = name
@@ -84,12 +86,11 @@ def get_location_name(location_id):
     return location_cache[location_id]
 
 
-def get_corp_contracts(corp_id):
+async def get_corp_contracts(corp_id: int):
     contracts = []
     page = 1
     while True:
-        url = f"{ESI_BASE}/corporations/{corp_id}/contracts/"
-        data = esi_get(url, params={"page": page})
+        data = await esi_get(f"/corporations/{corp_id}/contracts/", params={"page": page})
         if not data:
             break
         contracts.extend(data)
@@ -97,44 +98,69 @@ def get_corp_contracts(corp_id):
     return contracts
 
 
-def get_contract_items(corp_id, contract_id):
-    url = f"{ESI_BASE}/corporations/{corp_id}/contracts/{contract_id}/items/"
-    return esi_get(url)
+async def get_contract_items(corp_id: int, contract_id: int):
+    return await esi_get(f"/corporations/{corp_id}/contracts/{contract_id}/items/")
 
 
-def scan_contracts():
-    """Runs the full scan and returns (ship_counts, total_contracts)."""
-
-    get_access_token()
-
-    contracts = get_corp_contracts(CORP_ID)
+async def scan_contracts() -> Tuple[Counter, int]:
+    """
+    Runs the full scan and returns (ship_counts, total_aldranette_contracts).
+    Fully async and Railway‑friendly.
+    """
+    contracts = await get_corp_contracts(CORP_ID)
     item_exchange = [
         c for c in contracts
         if c.get("type") == "item_exchange" and c.get("status") == "outstanding"
     ]
 
-    ship_counts = Counter()
+    ship_counts: Counter = Counter()
     aldranette_contract_count = 0
 
+    # Pre‑fetch locations in parallel
+    loc_tasks = {
+        c["contract_id"]: asyncio.create_task(get_location_name(c.get("start_location_id")))
+        for c in item_exchange
+    }
+    await asyncio.gather(*loc_tasks.values())
+
+    # Filter to Aldranette contracts
+    aldranette_contracts = []
     for c in item_exchange:
         cid = c["contract_id"]
-        loc_id = c.get("start_location_id")
-        loc_name = get_location_name(loc_id)
+        loc_name = loc_tasks[cid].result()
+        if "aldranette" in loc_name.lower():
+            aldranette_contracts.append(c)
+            aldranette_contract_count += 1
 
-        if "aldranette" not in loc_name.lower():
-            continue
+    # Fetch items for all Aldranette contracts in parallel
+    item_tasks = {
+        c["contract_id"]: asyncio.create_task(get_contract_items(CORP_ID, c["contract_id"]))
+        for c in aldranette_contracts
+    }
+    await asyncio.gather(*item_tasks.values())
 
-        aldranette_contract_count += 1
-
-        items = get_contract_items(CORP_ID, cid)
-        if not items:
-            continue
-
+    # Collect all type_ids to pre‑warm type cache
+    type_ids = set()
+    for cid, task in item_tasks.items():
+        items = task.result() or []
         for it in items:
-            type_id = it.get("type_id")
+            tid = it.get("type_id")
+            if tid:
+                type_ids.add(tid)
+
+    # Pre‑warm type info and ship detection in parallel
+    await asyncio.gather(*(get_type_info(tid) for tid in type_ids))
+
+    # Now count ships
+    for cid, task in item_tasks.items():
+        items = task.result() or []
+        for it in items:
+            tid = it.get("type_id")
             qty = it.get("quantity", 0)
-            if type_id and qty > 0 and is_ship(type_id):
-                name = get_type_info(type_id)["name"]
+            if not tid or qty <= 0:
+                continue
+            if await is_ship(tid):
+                name = (await get_type_info(tid))["name"]
                 ship_counts[name] += qty
 
     return ship_counts, aldranette_contract_count
